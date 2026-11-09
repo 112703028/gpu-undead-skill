@@ -1,0 +1,8 @@
+# 密碼與設定:絕對不能上傳
+.env
+
+# 失敗截圖可能含帳號、IP、Jupyter token
+logs/
+
+__pycache__/
+*.pyc
