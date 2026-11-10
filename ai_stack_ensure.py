@@ -18,7 +18,11 @@
 import argparse
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -121,7 +125,8 @@ def print_connection_info(page, cfg):
     """到「容器管理 > 容器列表」讀 SSH 指令、Jupyter 連結與掛載並印出。
     連接埠每次重建都會變,所以每次都重新讀。容器剛建立時「服務資訊」分頁是停用的,
     要等容器進入運行中才會啟用,所以會等待(預設最多 180 秒,可用 AI_STACK_START_WAIT 調整)。
-    讀不到只警告,不影響結束碼。"""
+    讀不到只警告,不影響結束碼。成功時回傳 {"host", "port"},失敗回傳 None。"""
+    info = None
     try:
         page.locator("text=容器管理").first.click()
         page.wait_for_timeout(1000)
@@ -150,6 +155,8 @@ def print_connection_info(page, cfg):
         if not ssh:
             raise RuntimeError("服務資訊裡找不到 ssh 指令")
         print(f"SSH: {ssh.group(0)}", flush=True)
+        target = re.search(r"@(\S+)\s+-p\s+(\d+)", ssh.group(0))
+        info = {"host": target.group(1), "port": int(target.group(2))}
         jupyter = page.locator("a:has-text('連結')").first
         if jupyter.count():
             print(f"JUPYTER: {jupyter.get_attribute('href')}", flush=True)
@@ -166,6 +173,65 @@ def print_connection_info(page, cfg):
     except Exception as e:
         log(f"警告: 讀不到連線資訊 ({type(e).__name__}: {str(e).splitlines()[0]})")
         shot(page, "connection_info")
+    return info
+
+
+def restore_ssh_keys(info, cfg):
+    """用密碼 SSH 進容器,把備份的公鑰(存在掛載的儲存裡,重建後還在)併入 authorized_keys,
+    讓本機的金鑰可以直接登入。指令是冪等的:重複執行不會產生重複的金鑰。"""
+    try:
+        import paramiko
+    except ImportError:
+        raise RuntimeError("需要 paramiko 才能還原 SSH 金鑰: pip install paramiko")
+    backup = shlex.quote(cfg["AI_STACK_RESTORE_SSH_KEYS"])
+    password = cfg.get("AI_STACK_SSH_PASS") or cfg["AI_STACK_PASS"]
+    client = paramiko.SSHClient()
+    # 新容器的主機金鑰每次都不同,無法預先信任,只能接受(僅限這個一次性連線)
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    last = None
+    for _ in range(12):  # 容器剛啟動時 sshd 可能還沒好
+        try:
+            client.connect(info["host"], port=info["port"], username="root", password=password,
+                           timeout=15, allow_agent=False, look_for_keys=False)
+            break
+        except Exception as e:
+            last = e
+            time.sleep(5)
+    else:
+        raise RuntimeError(f"SSH 密碼登入失敗: {type(last).__name__}: {last}")
+    try:
+        cmd = (
+            f"test -f {backup} || {{ echo MISSING; exit 3; }}; "
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && "
+            f"cat ~/.ssh/authorized_keys {backup} | awk 'NF && !seen[$0]++' > ~/.ssh/authorized_keys.new && "
+            "mv ~/.ssh/authorized_keys.new ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && "
+            "wc -l < ~/.ssh/authorized_keys"
+        )
+        _, stdout, stderr = client.exec_command(cmd)
+        out = stdout.read().decode().strip()
+        rc = stdout.channel.recv_exit_status()
+        if rc == 3:
+            raise RuntimeError(f"容器裡找不到備份檔 {cfg['AI_STACK_RESTORE_SSH_KEYS']}")
+        if rc != 0:
+            raise RuntimeError(f"還原指令失敗(結束碼 {rc}): {stderr.read().decode().strip()}")
+        log(f"SSH 金鑰已還原,authorized_keys 共 {out} 把")
+    finally:
+        client.close()
+
+    # 用本機的金鑰實際登入一次,確認真的可以(不問密碼,失敗不影響結束碼)
+    if shutil.which("ssh"):
+        # known_hosts 指到暫存檔而不是 os.devnull:MSYS 版 ssh 不認得 Windows 的 "nul",會當成檔名寫到目前資料夾
+        with tempfile.TemporaryDirectory() as tmp:
+            known_hosts = (Path(tmp) / "known_hosts").as_posix()
+            r = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+                 "-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={known_hosts}",
+                 "-o", "ConnectTimeout=10", "-p", str(info["port"]), f"root@{info['host']}", "echo KEY_LOGIN_OK"],
+                capture_output=True, text=True, timeout=30)
+        if "KEY_LOGIN_OK" in r.stdout:
+            log("驗證成功:本機金鑰可以直接登入(不需密碼)")
+        else:
+            log(f"警告: 金鑰已還原,但本機金鑰登入驗證失敗: {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else '無輸出'}")
 
 
 def open_create_wizard(page, via_toolbar=False):
@@ -287,6 +353,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--test-wizard", action="store_true", help="跳過偵測,從工具列進入精靈並 dry-run(測試用)")
+    ap.add_argument("--restore-keys", action="store_true",
+                    help="容器已存在時也還原 SSH 金鑰(平常只在剛建立新容器時還原)")
     args = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -299,6 +367,9 @@ def main():
     if mount and not (mount.startswith(MOUNT_PREFIX) and len(mount) > len(MOUNT_PREFIX)):
         log(f"AI_STACK_MOUNT_PATH 必須以 {MOUNT_PREFIX} 開頭且後面要有名稱,例如 /mnt/data(目前是 {mount!r})")
         return 2
+    if args.restore_keys and not cfg.get("AI_STACK_RESTORE_SSH_KEYS"):
+        log("--restore-keys 需要在 .env 設定 AI_STACK_RESTORE_SSH_KEYS(容器內公鑰備份檔的路徑)")
+        return 2
     # 失敗(結束碼 1)時重試;重試一開始會重新偵測,所以不會重複建立容器
     rc = 1
     for attempt in range(1, 4):
@@ -309,6 +380,19 @@ def main():
             log(f"第 {attempt} 次失敗,5 秒後重試")
             time.sleep(5)
     return rc
+
+
+def maybe_restore_keys(info, cfg):
+    """有設 AI_STACK_RESTORE_SSH_KEYS 才還原。失敗只警告:容器已建好,不該因此變成整體失敗。"""
+    if not cfg.get("AI_STACK_RESTORE_SSH_KEYS"):
+        return
+    if not info:
+        log("警告: 沒有取得 SSH 連線資訊,略過還原 SSH 金鑰")
+        return
+    try:
+        restore_ssh_keys(info, cfg)
+    except Exception as e:
+        log(f"警告: 還原 SSH 金鑰失敗 ({type(e).__name__}: {e})")
 
 
 def run_once(args, cfg):
@@ -328,7 +412,9 @@ def run_once(args, cfg):
             state = container_state(page)
             if state:
                 log(f"容器已存在,不需處理: {state}")
-                print_connection_info(page, cfg)
+                info = print_connection_info(page, cfg)
+                if args.restore_keys:
+                    maybe_restore_keys(info, cfg)
                 return 0
             log("容器不存在")
             if args.check_only:
@@ -345,7 +431,8 @@ def run_once(args, cfg):
                 state = container_state(page)
                 if state:
                     log(f"建立成功: {state}")
-                    print_connection_info(page, cfg)
+                    info = print_connection_info(page, cfg)
+                    maybe_restore_keys(info, cfg)
                     return 10
             raise RuntimeError("已送出建立,但 30 秒內容器列表仍是空的")
         except Exception as e:

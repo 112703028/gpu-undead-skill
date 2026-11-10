@@ -42,6 +42,22 @@ AI_STACK_MOUNT_PATH=/mnt/data
 
 路徑必須以 `/mnt/` 開頭。沒設 `AI_STACK_MOUNT_PATH` 就不會掛載。
 
+### 重建後自動還原 SSH 金鑰(選用)
+
+容器每次重建都是全新環境,你電腦的公鑰不在登入名單裡,金鑰登入會失效(只能用密碼)。如果你有掛載儲存,可以把公鑰備份放在裡面,重建後讓腳本自動還原:
+
+1. 在容器裡把你的公鑰備份到掛載路徑(只需做一次),例如:`cat ~/.ssh/authorized_keys > /mnt/data/authorized_keys_backup`
+2. `pip install paramiko`
+3. 在 `.env` 設定:
+
+```
+AI_STACK_RESTORE_SSH_KEYS=/mnt/data/authorized_keys_backup
+```
+
+之後腳本每次**剛建立新容器**時,會用密碼 SSH 進去把備份併入 `~/.ssh/authorized_keys`,並用你本機的金鑰實際登入一次來驗證。已存在的容器想手動補還原,加上 `--restore-keys`。這個動作是冪等的,重複執行不會出現重複金鑰。
+
+注意:這會用 `.env` 裡的密碼做 SSH 登入,且接受容器的主機金鑰(新容器的主機金鑰每次都不同,無法預先信任)。只在你信任的網路使用。
+
 ## 單獨使用
 
 ```
