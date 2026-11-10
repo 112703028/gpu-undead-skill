@@ -112,26 +112,57 @@ def container_state(page):
     return " | ".join(re.sub(r"\s+", " ", rows.nth(i).inner_text()) for i in range(rows.count()))
 
 
-def print_connection_info(page):
-    """到「容器管理 > 容器列表 > 服務資訊」讀 SSH 指令與 Jupyter 連結並印出。
-    連接埠每次重建都會變,所以每次都重新讀。讀不到只警告,不影響結束碼。"""
+def tab_enabled(page, name):
+    tab = page.locator(f"[role=tab]:has-text('{name}')").first
+    return tab.count() > 0 and tab.get_attribute("aria-disabled") != "true"
+
+
+def print_connection_info(page, cfg):
+    """到「容器管理 > 容器列表」讀 SSH 指令、Jupyter 連結與掛載並印出。
+    連接埠每次重建都會變,所以每次都重新讀。容器剛建立時「服務資訊」分頁是停用的,
+    要等容器進入運行中才會啟用,所以會等待(預設最多 180 秒,可用 AI_STACK_START_WAIT 調整)。
+    讀不到只警告,不影響結束碼。"""
     try:
         page.locator("text=容器管理").first.click()
         page.wait_for_timeout(1000)
         page.locator("text=容器列表").first.click()
         settle(page, 3000)
-        page.locator("table.table").first.locator("tbody tr").first.locator("td").nth(1).click()
-        page.wait_for_timeout(1500)
-        page.locator("text=服務資訊").first.click()
+        row = page.locator("table.table").first.locator("tbody tr").first
+        deadline = time.time() + int(cfg.get("AI_STACK_START_WAIT", "180"))
+        while True:
+            if not tab_enabled(page, "內部掛載"):  # 分頁全停用代表沒有選到列
+                row.locator("td").nth(1).click()
+                page.wait_for_timeout(1500)
+            if tab_enabled(page, "服務資訊"):
+                break
+            if time.time() > deadline:
+                raise RuntimeError("容器還沒進入運行中,服務資訊分頁尚未啟用")
+            log("容器還在啟動,等待中...")
+            refresh = page.locator("button[name=refresh_btn]").first
+            if refresh.count() and refresh.is_visible():
+                refresh.click()
+            page.wait_for_timeout(10000)
+
+        page.locator("[role=tab]:has-text('服務資訊')").first.click()
         page.wait_for_timeout(3000)
         body = page.inner_text("body")
         ssh = re.search(r"ssh\s+\S+@\S+\s+-p\s+\d+", body)
         if not ssh:
-            raise RuntimeError("服務資訊裡找不到 ssh 指令(容器可能還在啟動中)")
+            raise RuntimeError("服務資訊裡找不到 ssh 指令")
         print(f"SSH: {ssh.group(0)}", flush=True)
         jupyter = page.locator("a:has-text('連結')").first
         if jupyter.count():
             print(f"JUPYTER: {jupyter.get_attribute('href')}", flush=True)
+
+        # 內部掛載:列出實際掛載,讓使用者(與 agent)確認資料路徑有沒有掛上
+        page.locator("[role=tab]:has-text('內部掛載')").first.click()
+        page.wait_for_timeout(2500)
+        panel = page.locator("[role=tabpanel]", has_text="掛載路徑").first  # 頁面有多個面板,多數是空的
+        if panel.count():
+            # 表格欄位是「名稱 / 掛載路徑 / 唯讀」,取資料列轉成 名稱->路徑
+            cells = [c.strip() for c in panel.locator("tbody td").all_inner_texts() if c.strip()]
+            mounts = [f"{cells[i]} -> {cells[i + 1]}" for i in range(0, len(cells) - 2, 3)]
+            print(f"MOUNT: {'; '.join(mounts) if mounts else '(沒有掛載)'}", flush=True)
     except Exception as e:
         log(f"警告: 讀不到連線資訊 ({type(e).__name__}: {str(e).splitlines()[0]})")
         shot(page, "connection_info")
@@ -150,6 +181,41 @@ def open_create_wizard(page, via_toolbar=False):
 def next_step(page):
     page.click("button:has-text('下一步')")
     page.wait_for_timeout(2500)
+
+
+MOUNT_PREFIX = "/mnt/"  # 網站的掛載路徑輸入框前面固定有 /mnt/
+
+
+def mount_storage(page, cfg):
+    """步驟 3:勾選「掛載儲存裝置」,選儲存、填路徑、(選填)設為 Jupyter 工作目錄。"""
+    sub_path = cfg["AI_STACK_MOUNT_PATH"].strip()[len(MOUNT_PREFIX):]
+    storage = cfg.get("AI_STACK_MOUNT_STORAGE", "").strip()
+    page.locator("xpath=//*[normalize-space(text())='掛載儲存裝置']/following::mat-checkbox[1]").click()
+    page.wait_for_timeout(1500)
+    page.locator("button:has-text('選擇儲存裝置')").first.click()
+    dlg = page.locator("mat-dialog-container").first
+    dlg.wait_for()
+    page.wait_for_timeout(1500)
+
+    rows = dlg.locator("tbody tr")
+    if rows.count() == 0:
+        raise RuntimeError("沒有可掛載的儲存裝置")
+    row = rows.filter(has_text=storage).first if storage else rows.first
+    if storage and rows.filter(has_text=storage).count() == 0:
+        raise RuntimeError(f"找不到儲存裝置 {storage}(可用: {[re.sub(r'\s+', ' ', r) for r in rows.all_inner_texts()]})")
+    name = re.sub(r"\s+", " ", row.inner_text()).strip()
+    # 必須點名稱儲存格;點列上的核取方塊只會讓畫面打勾,網站內部不會真的選取
+    row.locator("td").nth(1).click()
+    dlg.locator("input[name=path]").wait_for(timeout=10000)
+    dlg.locator("input[name=path]").fill(sub_path)
+    if cfg.get("AI_STACK_MOUNT_JUPYTER_WORKSPACE", "0") == "1":
+        dlg.locator("mat-slide-toggle").click()
+    page.wait_for_timeout(500)
+    dlg.locator("button:text-is('確認')").click()
+    page.wait_for_timeout(2000)
+    if page.locator("mat-dialog-container").count():
+        raise RuntimeError("掛載對話框沒有關閉,可能有欄位未通過驗證")
+    log(f"已設定掛載: {name} -> {MOUNT_PREFIX}{sub_path}")
 
 
 def run_wizard(page, cfg, dry_run):
@@ -196,6 +262,8 @@ def run_wizard(page, cfg, dry_run):
         raise RuntimeError("第 2 步沒有通過(仍停在建立資源頁),可能有必填欄位未填")
 
     # 步驟 3: 進階設定(全是選填,直接按「下一步 | 建立」)
+    if cfg.get("AI_STACK_MOUNT_PATH"):
+        mount_storage(page, cfg)
     shot(page, "wizard_step3")
     log("已到精靈第 3 步")
     if dry_run:
@@ -227,6 +295,10 @@ def main():
         if not cfg.get(k):
             log(f"缺少設定 {k}(請填 .env)")
             return 1
+    mount = cfg.get("AI_STACK_MOUNT_PATH", "").strip()
+    if mount and not (mount.startswith(MOUNT_PREFIX) and len(mount) > len(MOUNT_PREFIX)):
+        log(f"AI_STACK_MOUNT_PATH 必須以 {MOUNT_PREFIX} 開頭且後面要有名稱,例如 /mnt/data(目前是 {mount!r})")
+        return 2
     # 失敗(結束碼 1)時重試;重試一開始會重新偵測,所以不會重複建立容器
     rc = 1
     for attempt in range(1, 4):
@@ -256,7 +328,7 @@ def run_once(args, cfg):
             state = container_state(page)
             if state:
                 log(f"容器已存在,不需處理: {state}")
-                print_connection_info(page)
+                print_connection_info(page, cfg)
                 return 0
             log("容器不存在")
             if args.check_only:
@@ -273,7 +345,7 @@ def run_once(args, cfg):
                 state = container_state(page)
                 if state:
                     log(f"建立成功: {state}")
-                    print_connection_info(page)
+                    print_connection_info(page, cfg)
                     return 10
             raise RuntimeError("已送出建立,但 30 秒內容器列表仍是空的")
         except Exception as e:

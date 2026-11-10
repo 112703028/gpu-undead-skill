@@ -30,6 +30,18 @@ AI_STACK_PASS=<你的密碼>
 
 選填項目(容器名稱、GPU 型號、鏡像等)見 `.env.example`。`.env` 已被 `.gitignore` 排除,**不要提交它**。
 
+### 掛載儲存裝置(建議)
+
+容器被清掉時,沒掛載的檔案會一起消失。在 `.env` 加上掛載路徑,重建容器時會自動掛上你的儲存裝置,資料就不會跟著不見:
+
+```
+AI_STACK_MOUNT_PATH=/mnt/data
+# AI_STACK_MOUNT_STORAGE=<儲存名稱>    # 有多個儲存時指定,沒填就用清單第一個
+# AI_STACK_MOUNT_JUPYTER_WORKSPACE=0   # 1 = 設為 Jupyter 工作目錄
+```
+
+路徑必須以 `/mnt/` 開頭。沒設 `AI_STACK_MOUNT_PATH` 就不會掛載。
+
 ## 單獨使用
 
 ```
