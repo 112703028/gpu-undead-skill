@@ -73,7 +73,9 @@ def settle(page, ms=1500):
 
 def login(page, cfg):
     page.goto(cfg["AI_STACK_URL"], wait_until="networkidle", timeout=60000)
-    if "/account/login" in page.url:
+    # 根網址要等網站自己導向後才知道有沒有登入:出現登入框或側邊欄其中之一即可判斷
+    page.wait_for_selector("#account, .sidebar-main-menu-label", timeout=30000)
+    if page.locator("#account").count():
         page.fill("#account", cfg["AI_STACK_USER"])
         page.fill("#password", cfg["AI_STACK_PASS"])
         page.click("button[type=submit]:not([name=goToHome])")
@@ -277,7 +279,7 @@ def mount_storage(page, cfg):
     if cfg.get("AI_STACK_MOUNT_JUPYTER_WORKSPACE", "0") == "1":
         dlg.locator("mat-slide-toggle").click()
     page.wait_for_timeout(500)
-    dlg.locator("button:text-is('確認')").click()
+    dlg.locator("#positiveButton, button:text-is('確認')").last.click()
     page.wait_for_timeout(2000)
     if page.locator("mat-dialog-container").count():
         raise RuntimeError("掛載對話框沒有關閉,可能有欄位未通過驗證")
@@ -292,10 +294,12 @@ def run_wizard(page, cfg, dry_run):
     # 步驟 2: 建立資源
     # 順序很重要:選鏡像會重置 GPU 的選取,所以先鏡像、密碼,最後才選 GPU
     image = cfg.get("AI_STACK_IMAGE", "25.10-py3")
-    page.click("button:has-text('請選擇鏡像')")
+    # 按鈕文字在 2026-11 的升級後從「請選擇鏡像」改成「選擇鏡像」,兩種都接受
+    page.locator("button:has-text('選擇鏡像')").first.click()  # 也涵蓋舊的「請選擇鏡像」
     page.wait_for_timeout(1500)
     page.click(f"text={image}")
-    page.click("mat-dialog-actions button:text-is('選擇')")
+    # 升級後對話框的主按鈕是 <button id="positiveButton">(文字包在內層 div,用文字比對會失敗)
+    page.locator("mat-dialog-container #positiveButton").last.click()
     page.wait_for_timeout(1500)
     ssh_pass = cfg.get("AI_STACK_SSH_PASS") or cfg["AI_STACK_PASS"]
     pw = page.locator("input[type=password]")
@@ -311,12 +315,17 @@ def run_wizard(page, cfg, dry_run):
     count = cfg.get("AI_STACK_GPU_COUNT", "1")
     page.locator(rf"text=/^\s*{re.escape(gpu_model)}/").first.click()
     page.wait_for_timeout(800)
-    page.locator(rf"text=/-{re.escape(cuda)}\s*$/").first.click()
+    # 升級後的新介面沒有 CUDA 版本選項,有才選
+    has_cuda = page.locator("input[name=optcudaVersion]").count() > 0
+    if has_cuda:
+        page.locator(rf"text=/-{re.escape(cuda)}\s*$/").first.click()
     page.locator(rf"text=/^\s*{count} 片\s*$/").first.click()
     page.wait_for_timeout(800)
+    required = ["optgpuType", "optgpuQty"] + (["optcudaVersion"] if has_cuda else [])
     unchecked = page.evaluate(
-        "() => ['optgpuType','optcudaVersion','optgpuQty'].filter("
-        "n => !Array.from(document.querySelectorAll(`input[name=${n}]`)).some(e => e.checked))"
+        "(names) => names.filter("
+        "n => !Array.from(document.querySelectorAll(`input[name=${n}]`)).some(e => e.checked))",
+        required,
     )
     if unchecked:
         raise RuntimeError(f"這些必填選項沒有被選到: {unchecked}")
@@ -341,7 +350,11 @@ def run_wizard(page, cfg, dry_run):
     dialog = page.locator("mat-dialog-container")
     if dialog.count() and dialog.first.is_visible():
         log(f"確認對話框: {re.sub(r'\s+', ' ', dialog.first.inner_text())[:120]}")
-        dialog.first.locator("button").filter(has_text=re.compile("確認|確定|是|建立")).last.click()
+        positive = dialog.first.locator("#positiveButton")
+        if positive.count():
+            positive.last.click()
+        else:
+            dialog.first.locator("button").filter(has_text=re.compile("確認|確定|是|建立")).last.click()
         page.wait_for_timeout(3000)
     shot(page, "after_submit")
     log("已送出建立")
